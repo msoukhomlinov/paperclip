@@ -16113,6 +16113,7 @@ export function issueRoutes(
               throw notFound("Secret proposal not found");
             }
             await secretProposals.approve(issue.companyId, proposal.id, {
+              cascade: true,
               resolvedByUserId,
               assertCanResolve: (lockedProposal, txDb) =>
                 assertCanResolveProposal({
