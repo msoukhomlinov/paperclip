@@ -748,6 +748,7 @@ export function createSecretProposalsService(db: Db) {
             throw conflict(`Binding proposal requires pending secret proposal ${dependency.id}; retry with cascade=true`);
           }
           assertNotExpired(dependency);
+          await input.assertCanResolve?.(dependency, txDb);
           const created = await applySecretApproval(txDb, dependency, input);
           await markApproved(txDb, dependency, {
             resolvedByUserId: input.resolvedByUserId,

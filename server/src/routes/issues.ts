@@ -191,7 +191,10 @@ import {
   type QueuedCommentIssueContext,
 } from "../modules/wake-queue/index.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
-import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
+import {
+  assertCanResolveProposal,
+  assertSecretDefinitionAdmin as assertActorSecretDefinitionAdmin,
+} from "../services/secret-proposal-authorization.js";
 import {
   buildDocumentReviewContext,
   buildPlanReviewContext,
@@ -16121,6 +16124,8 @@ export function issueRoutes(
                   actor: req.actor,
                   companyId: issue.companyId,
                   proposal: lockedProposal,
+                  assertSecretDefinitionAdmin: () =>
+                    assertActorSecretDefinitionAdmin(req.actor, issue.companyId),
                 }),
             });
             await notifySecretProposalResolution({
