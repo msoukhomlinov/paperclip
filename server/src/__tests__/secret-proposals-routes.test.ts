@@ -8,6 +8,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
@@ -27,6 +28,7 @@ import {
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { issueRoutes } from "../routes/issues.js";
 import { secretRoutes } from "../routes/secrets.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
@@ -57,24 +59,32 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     db = createDb(started.connectionString);
   });
 
+  // Card acceptance can queue a fire-and-forget wake that lands a heartbeat
+  // run row just after the response, so teardown is best-effort in
+  // foreign-key order (wake rows first, run rows twice).
   afterEach(async () => {
     vi.restoreAllMocks();
-    await db.delete(activityLog);
-    await db.delete(issueComments);
-    await db.delete(companySecretProposals);
-    await db.delete(issueThreadInteractions);
-    await db.delete(companySecretBindings);
-    await db.delete(companySecretVersions);
-    await db.delete(companySecrets);
-    await db.delete(userSecretDeclarations);
-    await db.delete(userSecretDefinitions);
-    await db.delete(companySecretProviderConfigs);
-    await db.delete(issues);
-    await db.delete(heartbeatRuns);
-    await db.delete(agents);
-    await db.delete(principalPermissionGrants);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    const cleanups = [
+      () => db.delete(issueThreadInteractions),
+      () => db.delete(activityLog),
+      () => db.delete(issueComments),
+      () => db.delete(agentWakeupRequests),
+      () => db.delete(heartbeatRuns),
+      () => db.delete(companySecretProposals),
+      () => db.delete(companySecretBindings),
+      () => db.delete(companySecretVersions),
+      () => db.delete(companySecrets),
+      () => db.delete(userSecretDeclarations),
+      () => db.delete(userSecretDefinitions),
+      () => db.delete(companySecretProviderConfigs),
+      () => db.delete(issues),
+      () => db.delete(heartbeatRuns),
+      () => db.delete(agents),
+      () => db.delete(principalPermissionGrants),
+      () => db.delete(companyMemberships),
+      () => db.delete(companies),
+    ];
+    for (const cleanup of cleanups) await cleanup().catch(() => undefined);
   });
 
   afterAll(async () => {
@@ -221,6 +231,10 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       next();
     });
     app.use("/api", secretRoutes(db, { heartbeat: options?.heartbeat, issues: options?.issues }));
+    // The issue-thread card-acceptance route is where the production
+    // secret-proposal fallback lives; mounting it lets the card tests exercise
+    // the real `secretProposals.approve` cascade instead of an injected stub.
+    app.use("/api", issueRoutes(db, {} as never, {}));
     app.use(errorHandler);
     return app;
   }
@@ -540,6 +554,158 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       .send({ cascade: true });
     expect(approved.status).toBe(200);
     expect(await db.select().from(companySecrets)).toHaveLength(1);
+  });
+
+  it("cascades a pending secret proposal when a company admin accepts the binding card on the issue thread", async () => {
+    const fixture = await seedRun();
+    const agentApp = createAgentApp(fixture);
+    const secretProposal = await request(agentApp)
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "secret",
+        name: "dev/card-cascade/token",
+        value: "card-cascade-secret",
+        justification: "Needed by task",
+      });
+    expect(secretProposal.status).toBe(201);
+    const bindingProposal = await request(agentApp)
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretProposalId: secretProposal.body.id,
+        configPath: "env.CARD_CASCADE_TOKEN",
+        justification: "Inject for the task",
+      });
+    expect(bindingProposal.status).toBe(201);
+
+    // The card is the server-owned interaction created with the binding
+    // proposal; accepting it must run the real production fallback in the
+    // issues route, not an injected approver.
+    const cards = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, fixture.issueId));
+    expect(cards).toHaveLength(1);
+    const card = cards[0];
+    expect(card).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      payload: expect.objectContaining({
+        secretProposal: expect.objectContaining({
+          proposalId: bindingProposal.body.id,
+          configPath: "env.CARD_CASCADE_TOKEN",
+        }),
+      }),
+    });
+
+    const accepted = await request(createBoardApp(fixture))
+      .post(`/api/issues/${fixture.issueId}/interactions/${card.id}/accept`)
+      .send({});
+
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({
+      id: card.id,
+      status: "accepted",
+      result: expect.objectContaining({
+        outcome: "accepted",
+        secretProposal: expect.objectContaining({ status: "executed" }),
+      }),
+    });
+    expect(await db.select().from(companySecretProposals).where(eq(companySecretProposals.id, secretProposal.body.id)))
+      .toEqual([expect.objectContaining({ status: "approved", createdSecretId: expect.any(String) })]);
+    expect(await db.select().from(companySecretProposals).where(eq(companySecretProposals.id, bindingProposal.body.id)))
+      .toEqual([expect.objectContaining({ status: "approved", appliedBindingConfigPath: "env.CARD_CASCADE_TOKEN" })]);
+    const secrets = await db.select().from(companySecrets);
+    expect(secrets).toHaveLength(1);
+    expect(await db.select().from(companySecretBindings)).toEqual([
+      expect.objectContaining({
+        secretId: secrets[0].id,
+        targetId: fixture.agentId,
+        configPath: "env.CARD_CASCADE_TOKEN",
+      }),
+    ]);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, fixture.agentId));
+    expect(agent?.adapterConfig).toMatchObject({
+      env: { CARD_CASCADE_TOKEN: { type: "secret_ref", secretId: secrets[0].id, version: "latest" } },
+    });
+  });
+
+  it("denies the binding-card cascade to a non-admin even when the outer binding is resolvable", async () => {
+    const fixture = await seedRun();
+    const agentApp = createAgentApp(fixture);
+    const secretProposal = await request(agentApp)
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "secret",
+        name: "dev/card-cascade-guard/token",
+        value: "card-cascade-guard-secret",
+        justification: "Needed by task",
+      });
+    expect(secretProposal.status).toBe(201);
+    const bindingProposal = await request(agentApp)
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretProposalId: secretProposal.body.id,
+        configPath: "env.CARD_CASCADE_GUARD_TOKEN",
+        justification: "Inject for the task",
+      });
+    expect(bindingProposal.status).toBe(201);
+
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, fixture.issueId));
+    expect(card).toMatchObject({
+      status: "pending",
+      payload: expect.objectContaining({
+        secretProposal: expect.objectContaining({ proposalId: bindingProposal.body.id }),
+      }),
+    });
+
+    // A non-admin who is explicitly allowed to update the target agent
+    // (agents:configure) can resolve the outer binding, but must not be able
+    // to cascade-create the prerequisite company secret through the card.
+    await db.insert(companyMemberships).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: "board-user",
+      permissionKey: "agents:configure",
+    });
+
+    const denied = await request(createBoardApp(fixture, { admin: false }))
+      .post(`/api/issues/${fixture.issueId}/interactions/${card.id}/accept`)
+      .send({});
+
+    // The card records the failed execution instead of 409-ing the request:
+    // the production fallback refused the cascade before any secret existed.
+    expect(denied.status).toBe(200);
+    expect(denied.body).toMatchObject({
+      id: card.id,
+      status: "accepted",
+      result: expect.objectContaining({
+        outcome: "accepted",
+        secretProposal: expect.objectContaining({ status: "failed", errorCode: "http_403" }),
+      }),
+    });
+    expect(await db.select().from(companySecrets)).toHaveLength(0);
+    expect(await db.select().from(companySecretBindings)).toHaveLength(0);
+    expect(await db.select().from(companySecretProposals).where(eq(companySecretProposals.id, secretProposal.body.id)))
+      .toEqual([expect.objectContaining({ status: "pending" })]);
+    expect(await db.select().from(companySecretProposals).where(eq(companySecretProposals.id, bindingProposal.body.id)))
+      .toEqual([expect.objectContaining({
+        status: "rejected",
+        resolutionReason: "Interaction acceptance failed: http_403",
+      })]);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, fixture.agentId));
+    expect(agent?.adapterConfig?.env).toBeUndefined();
+    const comments = await db.select().from(issueComments);
+    expect(comments).toEqual([
+      expect.objectContaining({
+        body: expect.stringContaining("Secret binding execution failed"),
+      }),
+    ]);
   });
 
   it("approves a binding without cascade after its secret proposal was approved separately", async () => {
