@@ -518,6 +518,14 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       permissionKey: "agents:configure",
     });
 
+    const listed = await request(createBoardApp(fixture, { admin: false }))
+      .get(`/api/companies/${fixture.companyId}/secret-proposals?status=pending`);
+    expect(listed.status).toBe(200);
+    expect(listed.body.find((row: { id: string }) => row.id === bindingProposal.body.id)).toMatchObject({
+      viewerCanApprove: false,
+      approveBlockReason: "Company admin access required",
+    });
+
     const denied = await request(createBoardApp(fixture, { admin: false }))
       .post(`/api/companies/${fixture.companyId}/secret-proposals/${bindingProposal.body.id}/approve`)
       .send({ cascade: true });

@@ -181,7 +181,16 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     if (proposal.status !== "pending") {
       return { ...proposal, viewerCanApprove: false, approveBlockReason: "Proposal is no longer pending" };
     }
-    if (proposal.kind === "secret" && !hasSecretDefinitionAdminAccess(req, req.params.companyId as string)) {
+    // A binding backed by a still-pending secret proposal needs `cascade: true`,
+    // which creates the company secret and therefore requires the same admin
+    // access as approving that secret directly. Reflect that in the preflight
+    // so the UI does not offer an approval that is guaranteed to 403.
+    const requiresSecretDefinitionAdmin =
+      proposal.kind === "secret" ||
+      (proposal.kind === "binding" &&
+        Boolean(proposal.secretProposalId) &&
+        proposal.secretProposalStatus === "pending");
+    if (requiresSecretDefinitionAdmin && !hasSecretDefinitionAdminAccess(req, req.params.companyId as string)) {
       return { ...proposal, viewerCanApprove: false, approveBlockReason: "Company admin access required" };
     }
     const decision = await bindingApprovalDecision(req, proposal);
