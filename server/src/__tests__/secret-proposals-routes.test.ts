@@ -10,6 +10,7 @@ import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   companySecretBindings,
   companySecretProposals,
   companySecretProviderConfigs,
@@ -20,6 +21,7 @@ import {
   issueComments,
   issueThreadInteractions,
   issues,
+  principalPermissionGrants,
   userSecretDeclarations,
   userSecretDefinitions,
 } from "@paperclipai/db";
@@ -70,6 +72,8 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -473,6 +477,69 @@ describeEmbeddedPostgres("secret proposal routes", () => {
         body: expect.stringContaining("GET /api/agents/me/secrets"),
       }),
     ]);
+  });
+
+  it("requires company admin access to cascade-approve a binding backed by a pending secret proposal", async () => {
+    const fixture = await seedRun();
+    const agentApp = createAgentApp(fixture);
+    const secretProposal = await request(agentApp)
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "secret",
+        name: "dev/cascade-guard/token",
+        value: "cascade-guard-secret",
+        justification: "Needed by task",
+      });
+    expect(secretProposal.status).toBe(201);
+    const bindingProposal = await request(agentApp)
+      .post("/api/agents/me/secret-proposals")
+      .send({
+        kind: "binding",
+        secretProposalId: secretProposal.body.id,
+        configPath: "env.CASCADE_GUARD_TOKEN",
+        justification: "Inject for the task",
+      });
+    expect(bindingProposal.status).toBe(201);
+
+    // A non-admin who is explicitly allowed to update the target agent
+    // (agents:configure) must still not be able to cascade-create the
+    // prerequisite company secret, which normally requires admin access.
+    await db.insert(companyMemberships).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: "board-user",
+      permissionKey: "agents:configure",
+    });
+
+    const listed = await request(createBoardApp(fixture, { admin: false }))
+      .get(`/api/companies/${fixture.companyId}/secret-proposals?status=pending`);
+    expect(listed.status).toBe(200);
+    expect(listed.body.find((row: { id: string }) => row.id === bindingProposal.body.id)).toMatchObject({
+      viewerCanApprove: false,
+      approveBlockReason: "Company admin access required",
+    });
+
+    const denied = await request(createBoardApp(fixture, { admin: false }))
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${bindingProposal.body.id}/approve`)
+      .send({ cascade: true });
+    expect(denied.status).toBe(403);
+    expect(await db.select().from(companySecrets)).toHaveLength(0);
+    expect(await db.select().from(companySecretProposals).where(eq(companySecretProposals.id, secretProposal.body.id)))
+      .toEqual([expect.objectContaining({ status: "pending" })]);
+
+    // The company admin can still complete the cascade.
+    const approved = await request(createBoardApp(fixture))
+      .post(`/api/companies/${fixture.companyId}/secret-proposals/${bindingProposal.body.id}/approve`)
+      .send({ cascade: true });
+    expect(approved.status).toBe(200);
+    expect(await db.select().from(companySecrets)).toHaveLength(1);
   });
 
   it("approves a binding without cascade after its secret proposal was approved separately", async () => {
