@@ -35,6 +35,7 @@ import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wak
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { secretService } from "../services/secrets.js";
 import {
@@ -48,6 +49,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 describeEmbeddedPostgres("secret proposal routes", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
+  let heartbeat: ReturnType<typeof heartbeatService> | null = null;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-secret-proposals-${randomUUID()}`);
 
@@ -57,13 +59,17 @@ describeEmbeddedPostgres("secret proposal routes", () => {
     const started = await startEmbeddedPostgresTestDatabase("secret-proposal-routes");
     stopDb = started.cleanup;
     db = createDb(started.connectionString);
+    heartbeat = heartbeatService(db);
   });
 
-  // Card acceptance can queue a fire-and-forget wake that lands a heartbeat
-  // run row just after the response, so teardown is best-effort in
-  // foreign-key order (wake rows first, run rows twice).
+  // Card acceptance queues a fire-and-forget wake (an agent_wakeup_requests
+  // row plus a queued heartbeat run) that can land after the response. Drain
+  // any in-flight wakes first so the deletes below see a settled database;
+  // teardown then fails loudly on a real cleanup error instead of swallowing
+  // it (wake rows first, run rows twice as a backstop).
   afterEach(async () => {
     vi.restoreAllMocks();
+    await heartbeat?.drainActiveRunExecutions();
     const cleanups = [
       () => db.delete(issueThreadInteractions),
       () => db.delete(activityLog),
@@ -84,7 +90,7 @@ describeEmbeddedPostgres("secret proposal routes", () => {
       () => db.delete(companyMemberships),
       () => db.delete(companies),
     ];
-    for (const cleanup of cleanups) await cleanup().catch(() => undefined);
+    for (const cleanup of cleanups) await cleanup();
   });
 
   afterAll(async () => {
